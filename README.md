@@ -28,7 +28,7 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 - [ ] **Phase 4** `wgmma`（[04_wgmma.md](docs/notes/04_wgmma.md)）：✅ m64n64k16 正确性 + 描述符位域 + SW128 布局（+28.6%）；待：RS 变体 / 更大 K 深度
 - [ ] **Phase 5** 综合 GEMM（[05_gemm.md](docs/notes/05_gemm.md)）：✅ TMA 流水线 + wgmma 重叠（8192³ 追平 cuBLAS 72.2T）；✅ warp specialization + BM=128（C7520 消除，2048³ 117.6T）；✅ TMA store epilogue（L2 写流量 -48%，含 wgmma WAR 竞态复盘）
 - [ ] **Phase 6** cluster + DSMEM（[06_cluster.md](docs/notes/06_cluster.md)）：✅ 2-CTA cluster / mapa / 远程 mbarrier / TMA multicast / multicast GEMM；✅ ncu 验证 fetch 减半（L2 读 -17.3% ≈ A 减半模型）；✅ warp-spec × multicast 组合（115.7T，快窗 130.1T 打平纯 ws；L2 读 -13.4%，compute-bound 下无 wall-clock 兑现）
-- [ ] **Phase 7** 进阶（可选）：FP8 GEMM（multicast 兑现面）/ persistent kernel / 2×2 cluster / attention
+- [ ] **Phase 7** 进阶（[07_fp8.md](docs/notes/07_fp8.md)）：✅ fp8 wgmma m64n64k32 + 描述符复用实证（fp8 指令内部 ~fp22 累加指纹）；✅ fp8 ws GEMM——满载 2048³ 209.9T / 8192³ 174.8T（**fp8 满载 > fp16 快窗 130.1T**）、快窗 260.0T（峰值的 88%），L2 读精确减半；待：fp8 × multicast / persistent kernel / 2×2 cluster / attention
 
 ## 构建与运行
 
@@ -68,3 +68,4 @@ third_party/      # CUTLASS 等参考实现 (submodule, 仅作对照学习)
 - [04_wgmma.md](docs/notes/04_wgmma.md) — wgmma 指令 / GMMA 描述符位域 / SW128
 - [05_gemm.md](docs/notes/05_gemm.md) — 综合 GEMM：TMA 流水线 + wgmma 重叠（追平 cuBLAS）
 - [06_cluster.md](docs/notes/06_cluster.md) — cluster/DSMEM/multicast（含记账语义实验）
+- [07_fp8.md](docs/notes/07_fp8.md) — fp8 wgmma/GEMM（含指令内累加精度指纹）

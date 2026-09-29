@@ -89,6 +89,42 @@ __device__ __forceinline__ void wgmma_m64n64k16_f32_f16(uint64_t desc_a,
       : "l"(desc_a), "l"(desc_b), "r"(scale_d));
 }
 
+// wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3  D += A*B, A/B 均 smem 描述符
+// （asm 尾串与 CUTLASS MMA_64x64x32_F32E4M3E4M3_SS_TN 逐字对齐）。
+// 与 f16 k16 变体的差异：
+//   * 尾部操作数只有 scale-a/scale-b（±1 立即数），**无 trans**——8-bit 布局只支持 K-major
+//   * 描述符复用 gmma_desc_k_sw128 不变：SW128 原子按字节定义（CUTLASS
+//     Layout_K_SW128_Atom_Bits = Swizzle<3,4,3> ∘ (8 行 × 1024bit)），与元素位宽无关；
+//     fp8 的 k32 核心矩阵 = 8 行 × 32B，与 fp16 的 k16 核心矩阵字节同构，
+//     原子内 k 步进同为 32B（每原子 4 步）
+//   * 累加器 (warp, lane, r) -> (m, n) 映射与 f16 m64n64 完全相同
+__device__ __forceinline__ void wgmma_m64n64k32_f32_e4m3(uint64_t desc_a,
+                                                        uint64_t desc_b, float* d,
+                                                        uint32_t scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %34, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "
+      "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
+      " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+      " %16, %17, %18, %19, %20, %21, %22, %23, "
+      " %24, %25, %26, %27, %28, %29, %30, %31},"
+      " %32,"
+      " %33,"
+      " p,   1, 1;\n"  // scale-a, scale-b（fp8 无 trans 操作数）
+      "}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
+        "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
+        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
+        "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+        "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+        "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+        "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+      : "l"(desc_a), "l"(desc_b), "r"(scale_d));
+}
+
 // 寄存器屏障：阻止编译器跨 wgmma 异步窗口重排累加寄存器的读写
 // （等价 CUTLASS warpgroup_fence_operand）
 __device__ __forceinline__ void wgmma_fence_operand(float& reg) {
