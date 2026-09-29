@@ -9,7 +9,7 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 
 | 项目 | 值 |
 |------|-----|
-| GPU | NVIDIA H20-3e × 2 (Hopper, cc 9.0, 144GB HBM3e) |
+| GPU | NVIDIA H20-3e × 8 (Hopper, cc 9.0, 143.7GB HBM3e) |
 | Driver | 580.126.09 (CUDA 13.0) |
 | Toolkit | CUDA 12.9 (V12.9.41, `/usr/local/cuda`) |
 | 编译 | GCC 11.4 / CMake 3.22 / `-arch=sm_90a` |
@@ -26,8 +26,8 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 - [x] **Phase 2** `mbarrier`：expect_tx + producer-consumer 多级流水线（[02_pipeline.md](docs/notes/02_pipeline.md)）
 - [ ] **Phase 3** 算力密度基线（[03_compute.md](docs/notes/03_compute.md)）：FFMA / `mma.sync` 张量核峰值 / cuBLAS 对标
 - [ ] **Phase 4** `wgmma`（[04_wgmma.md](docs/notes/04_wgmma.md)）：✅ m64n64k16 正确性 + 描述符位域 + SW128 布局（+28.6%）；待：RS 变体 / 更大 K 深度
-- [ ] **Phase 5** cluster + DSMEM：2-CTA cluster 跨 CTA 共享内存访问
-- [ ] **Phase 6** 综合 GEMM：TMA + wgmma + 多级流水线 + warp specialization
+- [ ] **Phase 5** 综合 GEMM（[05_gemm.md](docs/notes/05_gemm.md)）：✅ TMA 流水线 + wgmma 重叠，8192³ 追平 cuBLAS（contended 72.2T vs 72.59T）；待：warp specialization / TMA epilogue
+- [ ] **Phase 6** cluster + DSMEM：2-CTA cluster 跨 CTA 共享内存访问
 - [ ] **Phase 7** 进阶（可选）：FP8 GEMM / persistent kernel / attention
 
 ## 构建与运行
@@ -64,3 +64,6 @@ third_party/      # CUTLASS 等参考实现 (submodule, 仅作对照学习)
 - [00_environment.md](docs/notes/00_environment.md) — 环境记录
 - [01_memcpy.md](docs/notes/01_memcpy.md) — 数据搬运三机制对比（naive / cp.async / TMA）
 - [02_pipeline.md](docs/notes/02_pipeline.md) — mbarrier 多级流水线（含反面教材）
+- [03_compute.md](docs/notes/03_compute.md) — 算力密度基线（FFMA / mma.sync / cuBLAS）
+- [04_wgmma.md](docs/notes/04_wgmma.md) — wgmma 指令 / GMMA 描述符位域 / SW128
+- [05_gemm.md](docs/notes/05_gemm.md) — 综合 GEMM：TMA 流水线 + wgmma 重叠（追平 cuBLAS）

@@ -103,9 +103,13 @@ __device__ __forceinline__ void wgmma_commit_group() {
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void wgmma_wait_group_0() {
-  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+// 等待直到最多还有 N 个未完成的 wgmma group（N=1: 保留 1 组在飞，重叠下一轮）
+template <int N>
+__device__ __forceinline__ void wgmma_wait_group() {
+  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
+
+__device__ __forceinline__ void wgmma_wait_group_0() { wgmma_wait_group<0>(); }
 
 // 通用 proxy 写 -> 异步 proxy（wgmma/ TMA）可见性围栏
 __device__ __forceinline__ void fence_proxy_async_shared_cta() {
