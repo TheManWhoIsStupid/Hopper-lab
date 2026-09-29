@@ -89,10 +89,86 @@ epilogue: wait_group<0> → 累加器写出
   ——epilogue 未优化，8192³ 下占比小，2048³ 下有优化空间。
 - 无 OOB 处理：M/N/K 须为 64 的倍数（correctness/bench 尺寸均满足）。
 
+## 5b: warp specialization + BM=128（`gemm_ws.cu`）
+
+上面"已知问题"里的 C7520 在这里修掉，顺手把 tile 升到 BM=128。
+
+### 结构（384 线程 = 3 warpgroup）
+
+```
+WG0 (tid 0..127)    producer：仅 tid0 跑独立 issue 循环（无累加器寄存器）
+WG1/WG2 (128..383)  consumer：各跑 m64n64k16，分别管输出的行 0-63 / 64-127
+```
+
+- tile: **BM=128**, BN=BK=64；stage = A 16KB + B 8KB = 24KB（SW128）。
+  两 consumer 共享同一份 B —— B 的 smem/带宽开销被两个 WG 摊薄，这正是大 tile
+  的意义。屏障：`full[s]` count=1（producer 登记 24KB expect）、`empty[s]`
+  count=256（两 consumer WG 全体 arrive）。producer 与 consumer **各跑各的循环**，
+  只经 barrier 交互——不再有"issue 放迭代末尾防自锁"的约束（那是单 WG 兼职
+  时的自我依赖）。
+- **A 的 TMA box 是 {64,128}**（K×M），一次装载 128 行。SW128 布局按 8 行原子沿
+  m 堆叠，行 64 起点 = 原子 8 = 偏移 8192（1024B 对齐，硬件从地址位恢复相位，
+  SBO 不变）。consumer wg 的描述符 = `sA + wg*8192 + kk*32`——同一 stage 里
+  两个 WG 各取各的 64 行半区，零拷贝。
+- consumer 内循环与 Phase 5 完全相同（fence → 4×wgmma → commit → wait<1> →
+  arrive empty），epilogue 行号 = `64*wg + m`。
+
+### C7520 验证
+
+| 内核 | ptxas 输出 |
+|---|---|
+| gemm_fused（单 WG 兼 producer） | 4× C7519 + **5× C7520**（串行化警告） |
+| gemm_ws（producer 独立 WG） | 15× C7519（info）+ **0× C7520** |
+
+producer WG 不持有累加器，divergent 路径不再横跨活着的 GMMA 寄存器窗口，
+编译器无需插 warpgroup.arrive 兜底——警告消失。
+
+### 数据（contended，min_ms）
+
+正确性: 512×512×256, S∈{2,3,4} 全 PASS。
+
+2048×2048×1024:
+
+| stages | min_ms | TFLOPS |
+|-------:|-------:|-------:|
+| 2      | 0.091  | 94.4  |
+| 3      | 0.074  | 116.2 |
+| 4      | 0.073  | **117.6** |
+| 6      | 0.091  | 94.6  |
+| 8      | 0.091  | 93.9  |
+
+8192×8192×8192:
+
+| stages | min_ms | TFLOPS |
+|-------:|-------:|-------:|
+| 2      | 15.30  | 71.9  |
+| 3      | 15.07  | 73.0  |
+| 4      | 15.04  | **73.1** |
+| 6      | 15.35  | 71.7  |
+
+- **2048 尺寸 +13.5%**（117.6 vs 103.6）。8192³ 73.1T，微超 Phase 5 的 72.2T
+  （该尺寸已 compute-bound，收益天花板就是张量核吞吐）。
+- **最优 S 从 2 变成 4**：独立 producer 后，TMA issue 与 wgmma 不再共享一个
+  warpgroup 的发射带宽，更深流水线才有意义；S=6 起掉头向下还是 occupancy
+  （S=6 → 144KB smem → 1 CTA/SM，512 CTA / 78 SM 波数量化）。
+- ncu 计数器（8192³ 最优配置，与 Phase 6 的 multicast 验证同批）：L2 读 sector
+  0.772G ≈ 24.7GB，正落在 **BM=128 fetch 模型 24GB** 上（8192 CTA × (A 2MB +
+  B 1MB)，BM=64 时是 32GB）——fetch 少 25%，行波数减半还顺带降 DRAM 读
+  14.1→8.9GB（B 的跨波重取减少）。
+
+### 记录
+
+- producer 循环里 `j >= S` 才等 empty——前 S 个 stage 无条件发射（prologue），
+  与 Phase 5 相同。
+- 寄存器压力比想象小：`cuobjdump -res-usage` 实测 S=4 版本 **58 reg/线程**
+  （384 线程 × 2 CTA = 44.5K reg < 64K，S=4 的 96KB×2=192KB smem 也放得下，
+  双 CTA/SM 驻留无压力）——累加器经 wgmma 操作数走专用路径，普通寄存器
+  配额没有被 32 个 f32 拖垮。
+- M 须为 128 的倍数（BM=128）。
+
 ## 下一步
 
-- warp specialization：producer 独立 warpgroup（修 C7520），consumer 2×warpgroup
-  BM=128（m64n64k16 ×2 拼）
 - epilogue: TMA store + swizzle 写出
-- cluster + DSMEM（Phase 6）: 跨 CTA 共享 A tile，省一半 smem 流量
+- warp specialization × multicast 组合（producer WG 天然适合接管 cluster 的
+  leader 发射职责）
 - 真空复测（与 Phase 3 的 idle-watch 一并）
