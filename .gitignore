@@ -1,0 +1,12 @@
+build/
+results/
+*.o
+*.so
+*.a
+compile_commands.json
+.vscode/
+.idea/
+*.swp
+*.swo
+__pycache__/
+*.pyc
