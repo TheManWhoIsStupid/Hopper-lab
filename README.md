@@ -27,7 +27,7 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 - [ ] **Phase 3** 算力密度基线（[03_compute.md](docs/notes/03_compute.md)）：FFMA / `mma.sync` 张量核峰值 / cuBLAS 对标
 - [ ] **Phase 4** `wgmma`（[04_wgmma.md](docs/notes/04_wgmma.md)）：✅ m64n64k16 正确性 + 描述符位域 + SW128 布局（+28.6%）；待：RS 变体 / 更大 K 深度
 - [ ] **Phase 5** 综合 GEMM（[05_gemm.md](docs/notes/05_gemm.md)）：✅ TMA 流水线 + wgmma 重叠，8192³ 追平 cuBLAS（contended 72.2T vs 72.59T）；待：warp specialization / TMA epilogue
-- [ ] **Phase 6** cluster + DSMEM（[06_cluster.md](docs/notes/06_cluster.md)）：✅ 2-CTA cluster / mapa / 远程 mbarrier / TMA multicast（记账语义实锤 + fetch 流量减半）；待：multicast 进 GEMM
+- [ ] **Phase 6** cluster + DSMEM（[06_cluster.md](docs/notes/06_cluster.md)）：✅ 2-CTA cluster / mapa / 远程 mbarrier / TMA multicast / multicast GEMM（armed 屏障拓扑 + 收尾同步，8192³ 持平 72.5T）；待：ncu 验证 fetch 减半
 - [ ] **Phase 7** 进阶（可选）：FP8 GEMM / persistent kernel / attention
 
 ## 构建与运行

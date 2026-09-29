@@ -80,9 +80,53 @@ complete_tx**。所以：每个接收 CTA 对自己的 full barrier 登记一次
 2. （沿用 Phase 5）多级流水的 issue 放迭代末尾；本阶段新增：multicast 的
    expect_tx 在每个接收 CTA 各做一次、发射只在一处。
 
+## 6c: multicast GEMM（`gemm_cluster.cu`）
+
+Phase 5 流水线 + cluster 数据复用：`__cluster_dims__(2,1,1)` 让 blockIdx.x 相邻
+两 CTA 成对（同 bm 不同 bn，共享 A tile）。A 走 multicast（leader 发射一条，
+两 CTA 各收一份），B 各自 unicast——**fetch 侧 A 流量减半**。
+
+屏障拓扑（6b 语义的直接应用）:
+
+| barrier | 位置 | count | 用途 |
+|---|---|---|---|
+| `full[s]` | 每 CTA | 1 | 各自 tid0 登记 16KB expect |
+| `empty_a[s]` | 仅 leader | 256 | 两 CTA 全体消费者 arrive（rank1 远程）——multicast 覆写两边 A 区，释放须双 CTA 确认；try_wait 只能本地等 ⇒ 放 leader |
+| `empty_b[s]` | 每 CTA | 128 | 自己的 B 区自己管 |
+| `armed[s]` | 仅 leader | 1 | rank1 登记 expect 后远程 arrive，rank0 见到才发射 multicast |
+
+`armed` 的必要性：mbarrier 的 tx 记账是**相位敏感**的。若 rank0 的 multicast
+记账先于 rank1 的 expect 登记落地，credit 会记到上一个（已完成的）相位——
+该 stage 永远等不满 → 挂死。armed 用一跳远程 arrive 把"登记完成"显式通知
+发射方，窗口彻底闭合（CUTLASS 用 cluster transaction barrier 干同样的事）。
+
+正确性: 512×512×256，S∈{2,3,4} 各 ×5 重复——全 PASS。
+
+| 尺寸 | 最优 | Phase 5 对照 |
+|---|---|---|
+| 2048×2048×1024 | 95.9T (S=2) | 103.6T（**-7%**） |
+| 8192³ | 72.5T (S=3) | 72.2T（持平） |
+
+诚实结论：当前条件下 multicast **没有可测的 wall-clock 收益**，2048 尺寸还有
+个位数回退。归因：(1) 8192³ 是 compute-bound（72T 已打平 cuBLAS），fetch 减半
+省的是 L2 带宽，只有 ncu 计数器（`lts__t_bytes`）能验证；(2) 每 stage 多了
+4 次 barrier 交互（远程 arrive + armed 等待），关键路径加了一跳；(3) 争用下
+相对排序本就不可信（Phase 3 教训）。multicast 的真实收益场景：更大 tile/更宽
+cluster（2×2）、L2 压力大的形状、或与 warp specialization 组合后 compute 更快
+时——留待后续。
+
+## 踩坑（6c 新增）
+
+- **cluster 内核收尾必须 cluster_sync**：最后一批远程 arrive（rank1→leader 的
+  empty_a/armed）可能还在互连上飞；先退出的 CTA smem 被回收，迟到 arrive 打到
+  已释放地址 = **ULF**（8192³ S=3 实测复现，512 正确性 15 连全过也拦不住——
+  纯时序竞态）。`barrier.cluster` 的 release 语义保证先于它的远程访存已落地，
+  结尾加一道即可闭合。
+
 ## 下一步
 
-- GEMM 集成: 2-CTA cluster 沿 N 维配对（同 bm 共享 A tile），A 走 multicast、
-  B 走 unicast；empty barrier 按"远程 arrive leader"的生产级做法 cluster 化
-- warp specialization（producer 独立 warpgroup，顺带修 Phase 5 的 C7520）
+- ncu `lts__t_bytes` 验证 multicast 的 fetch 减半（顺带补 Phase 1 的
+  dram__bytes 验证）
+- warp specialization（producer 独立 warpgroup，修 C7520）+ 2×2 cluster /
+  BM=128 大 tile——multicast 收益要配合更大的数据复用面
 - vacuum 复测（idle-watch cron 待机中）
