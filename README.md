@@ -23,7 +23,7 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 - [x] **Phase 1** 数据搬运（[01_memcpy.md](docs/notes/01_memcpy.md)）
   - [x] 1a: naive → `cp.async` → TMA 1D bulk 带宽对比
   - [x] 1b: TMA 2D tensor map + SWIZZLE_128B 布局（公式已 bit-exact 验证）
-- [ ] **Phase 2** `mbarrier`：expect_tx + producer-consumer 异步流水线
+- [x] **Phase 2** `mbarrier`：expect_tx + producer-consumer 多级流水线（[02_pipeline.md](docs/notes/02_pipeline.md)）
 - [ ] **Phase 3** `wgmma`：m64n64k16 起步，A/B 操作数 swizzle 布局，逐步对标 cuBLAS
 - [ ] **Phase 4** cluster + DSMEM：2-CTA cluster 跨 CTA 共享内存访问
 - [ ] **Phase 5** 综合 GEMM：TMA + wgmma + 多级流水线 + warp specialization
@@ -62,3 +62,4 @@ third_party/      # CUTLASS 等参考实现 (submodule, 仅作对照学习)
 
 - [00_environment.md](docs/notes/00_environment.md) — 环境记录
 - [01_memcpy.md](docs/notes/01_memcpy.md) — 数据搬运三机制对比（naive / cp.async / TMA）
+- [02_pipeline.md](docs/notes/02_pipeline.md) — mbarrier 多级流水线（含反面教材）

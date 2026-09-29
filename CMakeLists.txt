@@ -21,3 +21,4 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_90a>
 
 add_subdirectory(src/00_smoke)
 add_subdirectory(src/01_memcpy)
+add_subdirectory(src/02_pipeline)
