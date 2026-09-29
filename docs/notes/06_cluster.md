@@ -145,9 +145,72 @@ cluster（2×2）、L2 压力大的形状、或与 warp specialization 组合后
 - `dram__bytes_read`: 14.1 / 15.3 / 8.9 GB——方向对（ws 行波减半 ⇒ B 的跨波
   重取减少）但绝对值受 ncu 清缓存 + 共卡干扰大，只作参考。
 
+## 6d: warp-specialized multicast GEMM（`gemm_ws_cluster.cu`）
+
+5b 与 6c 的组合：producer WG 接管 6c 的 leader 发射职责（发射循环独立于
+累加器寄存器窗口），2 个 consumer WG 各管 BM=128 的 64 行半区，cluster
+拓扑沿用 6c（相邻 bn 成对、A 走 multicast、B 各自 unicast）。
+
+屏障拓扑 = 6c 语义 × warp-spec 的消费者数：
+
+| barrier | 位置 | count | 用途 |
+|---|---|---|---|
+| `full[s]` | 每 CTA | 1 | 各自 tid0 登记 24KB expect（A 16KB mcast + B 8KB） |
+| `empty_a[s]` | 仅 leader | 512 | 两 CTA 全部 512 个消费者线程 arrive（rank1 远程） |
+| `empty_b[s]` | 每 CTA | 256 | 自己的 B 区自己管 |
+| `armed[s]` | 仅 leader | 1 | rank1 登记 expect 后远程报 armed，rank0 才发射 |
+
+结构上两处沿用 6a 教训的预防性设计（非新踩坑）：producer WG 循环结束后
+**不提前 return**——`barrier.cluster` 的 `.aligned` 要求全 CTA 收敛；且
+cluster_sync 必须在 if/else **汇合后的单一调用点**（producer/consumer 分支
+各调一次 = 两个不同 PC，违规）。epilogue 因此移到 barrier 之后（D 无跨
+CTA 重叠，晚写无害）。8192³ fetch 模型: A 经 cluster 共享 8GB + B 8GB =
+16GB（5b ws 为 24GB，-33%）。
+
+正确性: 512×512×256，S∈{2,3,4} ×3 rep × 5 次独立运行（含 3 次 ncu
+replay 注入时序扰动）——全 PASS。
+
+吞吐（min_ms，CSV: `results/gemm_ws_cluster_*.csv`）:
+
+| 尺寸 | 最优 | 5b ws 对照 | 6c mcast 对照 |
+|---|---|---|---|
+| 2048×2048×1024 | **115.7T** (S=4) | 117.6T（-1.6%） | 95.9T（+21%） |
+| 8192³ 满载 | 73.1T (S=4) | 73.1T（持平） | 72.5T |
+| 8192³ 快窗 | **130.1T** (S=4) | 130.2T（持平） | — |
+
+ncu 同会话背靠背对照（8192³ S=4，`lts__t_sectors_op_read`）:
+
+| kernel | sectors | 折算 | fetch 模型 |
+|---|---:|---:|---:|
+| gemm_ws | 0.786G | 25.2GB | 24GB |
+| gemm_ws_cluster | 0.681G（两次采样 0.6810/0.6813，很稳） | 21.8GB | 16GB |
+
+- **-3.4GB / -13.4%，只有模型 -8GB 的 42%**（6c 的 BM=64 对照当年拿到
+  89%）——multicast 的 LTS 去重是真实的，但在 BM=128/ws 形状下打折，
+  疑与 L2 请求扇出方式有关，值得真空复采再下结论。
+- `dram__bytes_read` 8.93 / 8.94GB 持平——multicast 只动 A，DRAM 侧 B
+  主导（8192³ 每 bm 行波 B 全量重取），符合预期。
+
+结论：**(1)** producer WG 吸收 leader 职责后，6c 在 2048 的 -7% 惩罚
+消失（95.9 → 115.7T），但仍不及纯 ws——armed/empty_a 的跨 CTA 往返
+仍在关键路径上；**(2)** 快窗下 ws 与 ws+mcast 完全持平（8.448 vs
+8.451ms）：BM=128/S=4 的 fp16 wgmma 已 compute-bound（130/148T = 88%
+峰值），L2 读省 13% 兑现不成 wall-clock；**(3)** multicast 要变成
+性能，需要 fetch-bound 形状——更宽 cluster（2×2）、更大复用面，或
+FP8（算力 ×2、流量不变 ⇒ 平衡点移到带宽侧）——正好是 Phase 7 的路。
+
+意外收获——争用窗口的直接探测：显存被 sglang 占满（140GB、util 100%）
+时仍会开出**带宽空闲的快窗**（8192³ 从 73T 跳到 130T，今天 3 连样本；
+此前 5 次运行只中过 1 次），分钟级开合（几分钟后的 peak_flops 就测回
+45T 满载值）。⇒ (a) min_ms + 多次运行是抓快窗的唯一可靠协议；
+(b) idle-watch 的"空闲内存 ≥2.5GB"条件**永远等不到**（驻留 ≠ 压带宽），
+真空复测改用 peak_flops 自探测（FFMA ≥30T 即真空签名）。
+
 ## 下一步
 
-- 2×2 cluster / 与 warp specialization 组合——multicast 收益要配合更大的
-  数据复用面（gemm_ws 的 producer WG 天然适合接管 leader 发射职责）
-- vacuum 复测时重采一组干净的 lts/dram 计数器（顺带补 Phase 1 的
-  dram__bytes 验证）
+- ~~与 warp specialization 组合~~（6d 完成）
+- 2×2 cluster（4 CTA 复用面，A/B 双向 multicast）
+- FP8 GEMM + multicast（Phase 7：算力翻倍后 fetch 变瓶颈，multicast
+  的 L2 收益才有兑现面）
+- 真空复测（peak_flops 探针条件）时重采 lts/dram 干净计数器（顺带补
+  Phase 1 的 dram__bytes 验证）

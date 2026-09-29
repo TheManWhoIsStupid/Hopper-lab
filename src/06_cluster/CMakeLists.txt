@@ -17,3 +17,10 @@ target_include_directories(gemm_cluster PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(gemm_cluster PRIVATE CUDA::cuda_driver)
+
+add_executable(gemm_ws_cluster gemm_ws_cluster.cu)
+target_include_directories(gemm_ws_cluster PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(gemm_ws_cluster PRIVATE CUDA::cuda_driver)
