@@ -58,4 +58,29 @@ __device__ __forceinline__ void tma_load_2d(void* smem_dst,
       "l"(tmap), "r"(c0), "r"(c1), "r"(smem_u32(bar)));
 }
 
+// ---- TMA 写出（bulk async group 语义，与 load 的 mbarrier 记账是两套机制）----
+// store 不走 mbarrier：进度由 per-thread 的 bulk async-group 跟踪，
+// commit_group 收拢、wait_group.read 确认源 smem 已读完（可复用/可退出）。
+
+// smem -> tmap 的 (c0,c1) 处写一个 box（注意与 load 的操作数顺序相反：目的在前）
+__device__ __forceinline__ void tma_store_2d(const void* smem_src,
+                                             const CUtensorMap* tmap, int32_t c0,
+                                             int32_t c1) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
+      " [%0, {%1, %2}], [%3];\n" ::"l"(tmap),
+      "r"(c0), "r"(c1), "r"(smem_u32(smem_src))
+      : "memory");
+}
+
+__device__ __forceinline__ void tma_store_commit_group() {
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+// 等到最多还剩 N 组未"读源完毕"（smem 安全可复用）
+template <int N>
+__device__ __forceinline__ void tma_store_wait_read() {
+  asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(N) : "memory");
+}
+
 }  // namespace hopper

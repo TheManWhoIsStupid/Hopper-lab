@@ -166,9 +166,96 @@ producer WG 不持有累加器，divergent 路径不再横跨活着的 GMMA 寄�
   配额没有被 32 个 f32 拖垮。
 - M 须为 128 的倍数（BM=128）。
 
+## 5c: TMA store epilogue（`gemm_ws.cu` 的 `kTmaStore` 模板分支）
+
+补全异步搬运闭环：TMA 载入 → wgmma → **TMA 写出**。三个新机制：
+
+1. **`cp.async.bulk.tensor.2d.global.shared::cta.bulk_group`**（注意与 load
+   相反：目的 `[tmap,{c0,c1}]` 在前，源 smem 在后）。store 不走 mbarrier，
+   进度由 per-thread 的 bulk async-group 跟踪：`cp.async.bulk.commit_group`
+   收拢、`cp.async.bulk.wait_group.read 0` 确认源 smem 已读完（smem 可复用/
+   可退出的边界）。
+2. **`fence.proxy.async.shared::cta`**（generic→async proxy fence）：st.shared
+   写的暂存数据要被 TMA（async proxy）读，跨 proxy 的可见性必须显式 fence。
+3. **named barrier**（`bar.sync id, count`，id 1..15）：warp specialization 下
+   producer WG 已 return，`__syncthreads` 不可用，线程子集同步只能靠它。
+
+布局：每个 consumer WG 把自己的 64×64 f32 半区暂存进 A stage 0/1 区域（复用，
+16KB = 2 个 8KB slice），D 的 tensor map 用 **box {32 列, 64 行}**（32×4B=128B
+恰为一行 SW128），swizzle 公式与 1b 验证过的完全同构：行内 16B chunk 号与
+`(m%8)` 异或。两 WG 各自发射 2 个 box。
+
+### 数据（contended，min_ms）
+
+正确性: 512×512×256，两种 epilogue × S∈{2,3,4} 各 ×3 重复——全 PASS。
+
+2048×2048×1024:
+
+| epilogue | 最优 | S=4 | S=6 |
+|---|---:|---:|---:|
+| plain | 117.0T (S=3/4) | 117.0 | 94.8 |
+| tma | **119.0T (S=4)** | 119.0 | 102.8 |
+
+8192³: 73.2 vs 73.1 持平（compute-bound，epilogue 占比 <1%）。
+
+ncu 写侧（8192³ S=4，`lts__t_sectors_op_write`）:
+
+| epilogue | L2 写 sectors | 折算 | dram 写 |
+|---|---:|---:|---:|
+| plain | 24.33M | 779MB | 295.6MB |
+| tma | 12.60M | **403MB（-48%）** | 295.8MB |
+
+- plain 的累加器直接 st.global 是 wgmma 映射的分散写（每线程 4B 粒度跨 64 列
+  跳），**L2 写 sector 数是最小值（268MB）的 2.9 倍**；TMA store 经 smem 暂存
+  后整行写出，接近最小。DRAM 写持平——L2 在逐出前把 partial sector 合并了，
+  所以 plain 的代价平时藏在 L2 带宽里，只有计数器看得见。
+- wall-clock：最优点只 +1.7%（写侧本来就不是瓶颈），但 **S=6/8 处 +9%**——
+  差流水/低 occupancy 配置下 epilogue 尾巴占比更大，TMA 版把尾巴砍短了。
+- 采到一个孤立样本：8192³ tma S=4 单次 rep **8.68ms = 126.7T**（其余 rep 均
+  ~15ms，多轮重跑不复现）。按固定指令计数这不可能少干活，只能解释为 min_ms
+  抓到了 sglang 的服务微间隙（真空窗口）——**预告了真空复测的量级：≈148T
+  峰值的 85%**。
+
+### 踩坑：epilogue 暂存与在飞 wgmma 的 WAR 竞态（本仓库迄今最好的反面教材）
+
+症状链（完整复盘）:
+
+1. 正常时序 6/6 PASS；**ncu 采集时 S=3 tma 挂**（3264/262144 元素错）——
+   ncu 的注入时序漂移是免费的竞态压力测试。
+2. mismatch 分布直方图定位：**全部在 wg1 半区**、全部落在 8 行原子的
+   **0/2/4/6（每隔一个 1KB 原子）**、CTA 随机。
+3. 错误值量级 ~±10³⁻⁴——不是 D 值的置换（D 值 ~±10），而是 "**f32 位型被
+   wgmma 当 f16 读进累加器**" 的特征签名（f32±10 的高 16 位当 f16 ≈ ±2.5e4，
+   乘 B 求和 ≈ 1e5 = max_abs 实测值）。
+
+根因：暂存区 `sA + wg*16KB` 覆盖的是**整个 A stage（含对方的读半区）**——
+wg0 的 [0,16K) 暂存盖掉 wg1 在 stage 0 的读半区 [8K,16K)。而
+**`wgmma_wait_group<0>` 是 per-warpgroup 的**：wg0 等完只保证 wg0 自己的
+wgmma 读完，wg1 的最后一个 kblock 可能还在读。S=3 时最后一个 kblock 恰落
+stage 0（暂存目标），竞态窗口最大；S=2/4 与最后使用的 stage 隔 1-2 个迭代
+的松弛量，正常时序下掩盖。
+
+第一版"修复"把跨 WG barrier 放在**暂存写入之后**——看似合理（一道屏障既
+排空又保可见），实际伤害发生在写入期间，屏障放错了边，反而把偶发竞态变成
+3/3 确定性失败（两 WG 被同步到同一时刻开写，碰撞概率拉满）。
+
+正确时序（两道屏障各司其职）:
+
+```
+wgmma_wait_group<0>
+named_barrier(3, 256)      // 跨 WG：两个 consumer WG 的 wgmma 全部排空
+暂存写 st.shared            // 此后才能动 smem
+named_barrier(1 + wg, 128) // WG 内：暂存写对发射线程可见
+fence.proxy.async          // generic -> async proxy
+单线程发射 2×TMA store + commit + wait_group.read 0
+```
+
+教训：(1) per-WG 的异步完成语义延伸到 smem 复用时要按"最慢使用者"对齐；
+(2) 竞态类正确性检查必须多 rep（×3 起步，6c 的 ULF 同款教训）；(3) 错误值的
+**量级指纹**可以反推数据通路的污染方式。
+
 ## 下一步
 
-- epilogue: TMA store + swizzle 写出
 - warp specialization × multicast 组合（producer WG 天然适合接管 cluster 的
   leader 发射职责）
-- 真空复测（与 Phase 3 的 idle-watch 一并）
+- 真空复测（与 Phase 3 的 idle-watch 一并；8.68ms 样本预示 ~126T 量级）
