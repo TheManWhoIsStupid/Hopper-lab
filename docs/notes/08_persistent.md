@@ -115,8 +115,99 @@ persist 反正全程 1 CTA/SM，没有可丢的占用）。G 维度 wall-clock �
   DRAM 行波（4.1GB/4.25ms ≈ 0.97TB/s 自家口径），G=8 应显出 >260T；
   若仍 260T 附近，则快窗也是 compute-bound，"流量工具论"再 +1 票。
   （idle-watch cron 待机中。）
-- 8b: 原子 tile 队列消 2048 静态不均（预期 +4% 拿回 7b 差距并反超）；
-  sEp 双缓冲消每 tile store 排空。
-- BN=128 大 tile（m64n128，64 累加器/WG）——与 persistent 天然同框
-  （persistent 载体已在手，大 tile 直接往上叠）。
+- sEp 双缓冲消每 tile store 排空（8a 遗留；8b 未做）。
 - e5m2 / per-tensor scale 量化策略（真实输入范围 ≠ [-1,1]）。
+
+## 8b：BN=128 大 tile + 动态 tile 队列（gemm_fp8_bn128）
+
+设计（8a 底盘上两处改动）：
+
+- **BN=128**（`wgmma.m64n128k32.f32.e4m3`，64 累加器/thread）：每 kblock
+  指令数不变（2 WG × 4 条 k32）、单条 FLOP 翻倍（524K）；stage 32KB
+  （B tile 128 宽），sEp 2×32KB，**S≤5**（224KB 贴 227KB 上限——BN=64
+  能跑 S=8 的深度在这里拿不到）。累加器 (warp,lane,r)→(m,n) 映射同一
+  公式延拓 r∈[0,64)；90 regs 零 spill（8 变体全过 ptxas -v）。
+- **动态 tile 队列**（sched=dyn）：模块级 `__device__` 计数器 + 自复位
+  （最后退出的 producer 清零，timed path 零 memset）；tile 序号经
+  s_go[2] mbarrier 环从 producer tid0 交接给 256 消费者；越界值也交接
+  （消费者据此退出）。static 路径保留（同 binary A/B）。
+
+正确性：512 单波 + 2048 多波 × S{2,4,5} × G{1,8} × {sta,dyn} × 3 reps
+全 PASS（24/24）。
+
+### 坑（本轮最有价值的产出）：warpgroup 集合指令 vs 非一致 break
+
+初版 dyn 在 **multi-wave 且 kblocks < S**（2048×2048×256, S=4/5）必现
+illegal instruction；static / K=512(kb=4=S) / S=2(kb=2=S) / 单波全过。
+定位链：compute-sanitizer → 最小 repro → 配置二分 → cuda-gdb 取故障
+PC → cuobjdump 对 SASS 偏移 `+0x9A0 = WARPGROUP.ARRIVE`（编译器为
+QGMMA 注入，nvcc C7519 警告逐条对应），故障 warp = wg1 leader。
+
+机制：s_go[2] 环在 producer 领先 ≥2 tile 时，对同一 buffer 的**第二次
+覆写/相位翻转**能插进同一 WG 不同 warp 的"wait 通过→读 s_tile"之间
+——不同 warp 读到不同 tile 值，读到越界值的 warp 提前 break 退出
+kernel，余下 warp 独自执行 warpgroup 集合指令 = illegal instruction。
+kblocks ≥ S 时该门控落在 tile 中段（读完之后），永不触发；kblocks < S
+时领先突破 2，必现。K=512 恰在边界（领先=2），3 reps 未爆属运气。
+
+修复：**s_rel[2] 读释放屏障**（count 256）——producer 覆写前
+`wait_parity(s_rel[p], ((taken>>1)-1)&1)`，消费者读完（含越界值）即
+arrive。把"领先"上锁到消费者读进度，对任意 kblocks/S 安全；代价
+producer +1 wait / consumer +1 arrive，**每 tile 各一次**（非每 kblock），
+bench 无感。修复后故障配置 3 reps 全过 + 24/24。
+
+教训（比修复更值钱）：**凡 wgmma 在场，warpgroup 的 4 个 warp 必须
+走完全一致的循环路径**——编译器在每个 wgmma 区周围注入
+warpgroup.arrive/wait（C7519），任何"共享内存值驱动的 break"都可能让
+部分 warpgroup 撞上集合指令。tile 交接值要么进寄存器一致的路径，要么
+配读释放屏障。
+
+### 数据（同日满载，min_ms；对照 7b 174.59T / 8a 174.5T @8192，
+2048: 7b 208.4T / 8a 200.3T）
+
+2048×2048×1024（tile 256/78 = 3.28/CTA）：
+
+| S | G=1 sta | G=1 dyn | G=8 sta | G=8 dyn |
+|---|---------|---------|---------|---------|
+| 2 | 168.93  | 169.04  | 179.08  | 166.94  |
+| 3 | 177.19  | 172.74  | 177.07  | 172.29  |
+| 4 | 179.68  | 174.76  | 180.52  | 174.76  |
+| 5 | 182.49  | 176.37  | 182.11  | 178.36  |
+
+8192×8192×8192：
+
+| S | G=1 sta | G=1 dyn | G=8 sta | G=8 dyn |
+|---|---------|---------|---------|---------|
+| 3 | 172.68  | 172.96  | 172.76  | 172.86  |
+| 4 | 173.01  | 173.10  | 173.18  | 173.69  |
+| 5 | 173.58  | 173.44  | 173.31  | **173.92** |
+
+ncu（G=8 S=5，单发 repro）：
+
+| 配置 | DRAM | L2 | 时间 |
+|------|------|----|------|
+| 8192 sta → dyn | 0.93→0.93GB（平） | 7.27→7.68GB（+5.6%） | 平 |
+| 2048 sta → dyn | 13.1→20.7MB（+58%） | 74.5→79.4MB（+6.6%） | -2~-4T |
+
+### 结论
+
+1. **8192³ 持平**（173.92 vs 8a 174.5T）：计算密度翻倍在满载下零收益。
+   指令数/barrier 数不是约束——"SM cycle 型争用"再 +1 票（8a 定律
+   第二次兑现：换计算密度的轴也搬不动满载墙）。
+2. **2048 回退 -9% 是摊销型，非 BN=128 本质缺陷**：K 扫描（S=5 sta，
+   ncu serial）K=640/1024/2048 → 169/184/198T，K=2048 追平 8a@K=1024。
+   构成：环回卷（S≤5 上限）+ 每 tile 切换开销 + D 写 floor（16MB 恒定，
+   小 K 时占 10%）。BN=128 要 2× 深的 K 才到 BN=64 的摊销点。
+3. **dyn 没修 2048 静态损失**（dyn ≤ sta 全表）：8a "静态量化 +22%"
+   的理论在此被证伪——损失在每 tile 效率不在 tile 分配。dyn 自身的
+   代价结构清晰：L2 +5~6%（领序发散破坏紧凑窗口）、大 shape 被 L2
+   吸收（DRAM 平/时间平），小 shape DRAM +58% 且时间可见。
+4. BN=128 的 DRAM G=8 930MB vs 8a 605MB（+54%）：L2 命中率结构变差
+   （tile 数减半 → 同窗共享面变窄），时间照样不动——流量非货币 +1 票。
+
+### 8b 后续
+
+- sEp 双缓冲 + commit group 跨 tile 排空（8a/8b 共同的每 tile 串行点）。
+- 2-CTA cluster + distributed smem：两 CTA 拼出等效 S=10 深度，直接攻
+  2048 摊销缺口；也顺势把 cluster/DSMEM 这条 Hopper 特性收进主线。
+- 小 K 场景按 K 自适应选 BN=64/BN=128 路径（同一 persistent 底盘）。
