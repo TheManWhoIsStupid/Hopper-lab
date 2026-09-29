@@ -10,3 +10,10 @@ target_include_directories(gemm_fp8 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(gemm_fp8 PRIVATE CUDA::cuda_driver)
+
+add_executable(gemm_fp8_cluster gemm_fp8_cluster.cu)
+target_include_directories(gemm_fp8_cluster PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(gemm_fp8_cluster PRIVATE CUDA::cuda_driver)
