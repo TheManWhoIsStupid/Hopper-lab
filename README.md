@@ -20,7 +20,9 @@ Hopper 的核心硬件特性，最终目标是做出能对标 cuBLAS 的 GEMM，
 ## 研究路线
 
 - [x] **Phase 0** 框架搭建：device query / timer / checker / bench harness（vectorAdd 冒烟测试）
-- [ ] **Phase 1** 数据搬运：naive copy → `cp.async` → **TMA**（swizzle 布局），带宽对比
+- [ ] **Phase 1** 数据搬运
+  - [x] 1a: naive → `cp.async` → TMA 1D bulk 带宽对比（[01_memcpy.md](docs/notes/01_memcpy.md)）
+  - [ ] 1b: TMA 2D tensor map + swizzle 布局
 - [ ] **Phase 2** `mbarrier`：expect_tx + producer-consumer 异步流水线
 - [ ] **Phase 3** `wgmma`：m64n64k16 起步，A/B 操作数 swizzle 布局，逐步对标 cuBLAS
 - [ ] **Phase 4** cluster + DSMEM：2-CTA cluster 跨 CTA 共享内存访问
@@ -59,3 +61,4 @@ third_party/      # CUTLASS 等参考实现 (submodule, 仅作对照学习)
 ## 已有笔记
 
 - [00_environment.md](docs/notes/00_environment.md) — 环境记录
+- [01_memcpy.md](docs/notes/01_memcpy.md) — 数据搬运三机制对比（naive / cp.async / TMA）
