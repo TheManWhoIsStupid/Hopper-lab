@@ -60,9 +60,69 @@ cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes
 4. naive 在 1 block/SM 时最惨（45%）：256 线程×16B outstanding = 4KB/SM 在飞，
    远不够填饱 HBM3e。
 
+## Phase 1b: TMA 2D tensor map + swizzle
+
+**代码**: `src/01_memcpy/tma2d_swizzle.cu` · **数据**: `results/tma2d_swizzle.csv`
+
+### 实验设计
+
+8192×8192 fp32 矩阵，box = **32 列 × 128 行**（内维 32×4B = **128B，正好等于
+swizzle 宽度**），每 box 16KB。对比 `SWIZZLE_NONE` vs `SWIZZLE_128B`。
+
+消费方式特意选了 **列读**（每 warp 32 线程读同列不同行）——NONE 下 32 线程全部
+落在同一 bank（32-way conflict），128B swizzle 把它们散到 8 个 chunk（4-way）。
+
+### 关键 API / 指令记录
+
+```cpp
+// host: 描述"怎么搬"的 descriptor
+cuTensorMapEncodeTiled(&tmap, FLOAT32, /*rank*/2, gmem_ptr,
+                       /*globalDim*/{8192cols, 8192rows},   // dim[0] 是最内维!
+                       /*globalStrides*/{32768B},           // 只给 dim1.., 必须 16 的倍数
+                       /*boxDim*/{32, 128},
+                       /*elementStrides*/{1,1}, INTERLEAVE_NONE,
+                       swizzle /* NONE 或 128B */, L2_128B, OOB_FILL_NONE);
+
+// kernel 参数必须 __grid_constant__，PTX 里用 [&tmap] 作 descriptor 操作数
+cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+    [smem], [tmap, {x, y}], [bar];    // 坐标是元素单位
+```
+
+### SWIZZLE_128B 的 smem 地址公式（本文档最重要的一条 ⭐）
+
+TMA 写 smem 时，行内 16B chunk 序号会与行号做异或（CUTLASS 的 `Swizzle<3,4,3>`）:
+
+```
+smem_word(row, col) = row * (128B/4B) + ( ((col/4) ^ (row%8)) * 4 + col%4 )
+                                          ~~~~~~~~~~~~~~~ 16B chunk 变换
+```
+
+**验证方式**: kernel 用该公式从 swizzled smem 读值写回，与 host 期望 bit-exact 比对
+→ PASS ✅。这个公式就是将来 wgmma 从 smem 读操作数时的布局（也是调试 CUTLASS
+共享内存布局的钥匙）。约束: box 内维字节 = swizzle 宽度的倍数，smem 基址 128B 对齐。
+
+### 数据（满载 GPU）
+
+| mode | 78 (1/SM) | 156 (2/SM) | 312 (4/SM) | 624 (8/SM) |
+|------|-----------|------------|------------|------------|
+| swizzle_none | 1334 GB/s (27.7%) | 2279 (47.3%) | 3349 (69.6%) | 3684 (76.5%) |
+| swizzle_128B | 1492 (31.0%) | 2446 (50.8%) | 3442 (71.5%) | 3657 (76.0%) |
+| **加速比** | **+11.8%** | +7.3% | +2.8% | ≈0 |
+
+### 分析
+
+1. **bank conflict 的代价在低占用率时最明显**（+12%）——此时没有足够的并行
+   warp 来隐藏冲突延迟；占用率升高后延迟被隐藏，差距消失。结论: swizzle 不是
+   可选项，真实 GEMM 里 smem 读取远比本实验密集，没有 swizzle 的 K-major 布局
+   是不可用的。
+2. 本实验消费太轻（每 16KB box 只读 1KB），冲突代价被稀释——纯 smem bank
+   conflict 微基准留作独立实验（Phase 3 wgmma 前做更有意义）。
+3. **16KB box (3.66TB/s) vs 1a 的 32KB tile (3.86TB/s)**: box 越小，单位数据的
+   TMA 发射 + mbarrier 等待次数越多。GEMM tile 设计要在"流水线粒度"和"smem
+   容量"之间权衡（Phase 5 会回到这点）。
+
 ## 待办 / 后续
 
 - [ ] GPU 空闲时复测绝对值
-- [ ] **Phase 1b: TMA 2D tensor map + swizzle**（`cuTensorMapEncodeTiled` +
-      `cp.async.bulk.tensor.2d`，SWIZZLE_128B 的 smem 地址变换规则——wgmma 的前置知识）
-- [ ] ncu 验证: `dram__bytes.sum` 与理论搬运量对账
+- [ ] ncu 验证: `dram__bytes.sum` 与理论搬运量对账; 观察 smem bank conflict 计数器
+- [ ] 32B/64B swizzle 模式的公式验证（目前只验证了 128B，够 wgmma 用）
